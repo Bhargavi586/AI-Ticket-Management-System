@@ -1,19 +1,32 @@
-from django.contrib.auth import get_user_model
+
+from django.contrib.auth.tokens import default_token_generator
+from django.core.mail import send_mail
 from django.db import IntegrityError, transaction
+from django.utils.encoding import force_bytes
+from django.utils.http import urlsafe_base64_encode
+
 from rest_framework import generics, status
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
+
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.views import TokenObtainPairView
 
 from .models import User
-from .serializers import RegisterSerializer, GoogleLoginSerializer
+from .serializers import (
+    RegisterSerializer,
+    GoogleLoginSerializer,
+    PasswordResetRequestSerializer,
+    PasswordResetConfirmSerializer,
+)
 from .permissions import IsAdmin, IsCustomer, IsSupportAgent, IsTeamLead
 
 
+# CUSTOM JWT LOGIN SERIALIZER
 class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
+
     @classmethod
     def get_token(cls, user):
         token = super().get_token(user)
@@ -24,18 +37,22 @@ class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
 
     def validate(self, attrs):
         data = super().validate(attrs)
+
         data.update({
             'username': self.user.username,
             'email': self.user.email,
             'role': self.user.role,
         })
+
         return data
 
 
+# JWT LOGIN VIEW
 class CustomTokenObtainPairView(TokenObtainPairView):
     serializer_class = CustomTokenObtainPairSerializer
 
 
+# USER REGISTRATION
 class RegisterView(generics.CreateAPIView):
     serializer_class = RegisterSerializer
     permission_classes = [AllowAny]
@@ -44,6 +61,7 @@ class RegisterView(generics.CreateAPIView):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         user = serializer.save()
+
         return Response({
             "message": "Registration successful!",
             "username": user.username,
@@ -52,6 +70,7 @@ class RegisterView(generics.CreateAPIView):
         }, status=status.HTTP_201_CREATED)
 
 
+# USER PROFILE
 class ProfileView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -64,6 +83,7 @@ class ProfileView(APIView):
         })
 
 
+# CUSTOMER DASHBOARD
 class CustomerDashboardView(APIView):
     permission_classes = [IsCustomer]
 
@@ -75,6 +95,7 @@ class CustomerDashboardView(APIView):
         })
 
 
+# ADMIN DASHBOARD
 class AdminDashboardView(APIView):
     permission_classes = [IsAdmin]
 
@@ -86,6 +107,7 @@ class AdminDashboardView(APIView):
         })
 
 
+# SUPPORT AGENT DASHBOARD
 class SupportAgentDashboardView(APIView):
     permission_classes = [IsSupportAgent]
 
@@ -97,6 +119,7 @@ class SupportAgentDashboardView(APIView):
         })
 
 
+# TEAM LEAD DASHBOARD
 class TeamLeadDashboardView(APIView):
     permission_classes = [IsTeamLead]
 
@@ -108,16 +131,19 @@ class TeamLeadDashboardView(APIView):
         })
 
 
+# LOGOUT
 class LogoutView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
         refresh_token = request.data.get('refresh')
+
         if not refresh_token:
             return Response(
                 {"error": "Refresh token is required."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
         try:
             RefreshToken(refresh_token).blacklist()
         except Exception:
@@ -125,57 +151,67 @@ class LogoutView(APIView):
                 {"error": "Invalid or expired refresh token."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
         return Response(
             {"message": "Logout successful!"},
             status=status.HTTP_200_OK,
         )
 
 
+# GENERATE JWT TOKENS
 def issue_tokens(user):
     refresh = RefreshToken.for_user(user)
     refresh['role'] = user.role
     refresh['username'] = user.username
     refresh['email'] = user.email
+
     return {
         'refresh': str(refresh),
         'access': str(refresh.access_token),
     }
 
 
+# GOOGLE LOGIN
 class GoogleLoginView(APIView):
     permission_classes = [AllowAny]
 
     def post(self, request):
         serializer = GoogleLoginSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+
         google_data = serializer.validated_data['token']
         email = google_data['email'].strip().lower()
         google_sub = google_data['sub']
 
         try:
             with transaction.atomic():
+
                 user = User.objects.select_for_update().filter(
                     google_sub=google_sub
                 ).first()
 
                 if user is None:
-                    # Never silently attach a Google identity to an existing
-                    # password account based on email alone.
+
                     existing_email_user = User.objects.filter(
                         email__iexact=email
                     ).first()
+
                     if existing_email_user:
-                        return Response({
-                            "error": (
-                                "An account with this email already exists. "
-                                "Sign in with your password, then link Google "
-                                "using the authenticated google-link endpoint."
-                            )
-                        }, status=status.HTTP_409_CONFLICT)
+                        return Response(
+                            {
+                                "error": (
+                                    "An account with this email already exists. "
+                                    "Sign in with your password, then link Google "
+                                    "using the authenticated google-link endpoint."
+                                )
+                            },
+                            status=status.HTTP_409_CONFLICT,
+                        )
 
                     base_username = f"google_{google_sub}"[:140]
                     username = base_username
                     suffix = 1
+
                     while User.objects.filter(username=username).exists():
                         username = f"{base_username[:135]}_{suffix}"
                         suffix += 1
@@ -186,31 +222,49 @@ class GoogleLoginView(APIView):
                         role=User.Role.CUSTOMER,
                         google_sub=google_sub,
                     )
+
                     user.set_unusable_password()
                     user.save()
                     created = True
+
                 else:
                     created = False
-                    if user.email.lower() != email:
-                        return Response(
-                            {"error": "Google account email does not match the linked account."},
-                            status=status.HTTP_403_FORBIDDEN,
-                        )
 
-                if not user.is_active:
-                    return Response(
-                        {"error": "This account is inactive."},
-                        status=status.HTTP_403_FORBIDDEN,
-                    )
         except IntegrityError:
-            # A concurrent first login may have created this Google identity.
-            user = User.objects.filter(google_sub=google_sub).first()
+            user = User.objects.filter(
+                google_sub=google_sub
+            ).first()
+
             if user is None:
                 return Response(
-                    {"error": "Unable to create the account. Please try again."},
+                    {
+                        "error": (
+                            "Unable to create the account. Please try again."
+                        )
+                    },
                     status=status.HTTP_409_CONFLICT,
                 )
+
             created = False
+
+        # VERIFY ACCOUNT DETAILS BEFORE ISSUING TOKENS
+
+        if user.email.lower() != email:
+            return Response(
+                {
+                    "error": (
+                        "Google account email does not match "
+                        "the linked account."
+                    )
+                },
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        if not user.is_active:
+            return Response(
+                {"error": "This account is inactive."},
+                status=status.HTTP_403_FORBIDDEN,
+            )
 
         response_data = {
             "message": "Google login successful!",
@@ -219,45 +273,129 @@ class GoogleLoginView(APIView):
             "email": user.email,
             "role": user.role,
         }
+
         response_data.update(issue_tokens(user))
-        return Response(response_data, status=status.HTTP_200_OK)
+
+        return Response(
+            response_data,
+            status=status.HTTP_200_OK,
+        )
 
 
+# GOOGLE ACCOUNT LINKING
 class GoogleAccountLinkView(APIView):
     permission_classes = [IsAuthenticated]
 
     def post(self, request):
         serializer = GoogleLoginSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
+
         google_data = serializer.validated_data['token']
         google_email = google_data['email'].strip().lower()
         google_sub = google_data['sub']
 
         if request.user.email.lower() != google_email:
             return Response(
-                {"error": "The Google email must match your signed-in account email."},
+                {
+                    "error": (
+                        "The Google email must match your signed-in account email."
+                    )
+                },
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        linked_user = User.objects.filter(google_sub=google_sub).exclude(
-            pk=request.user.pk
-        ).first()
+        linked_user = User.objects.filter(
+            google_sub=google_sub
+        ).exclude(pk=request.user.pk).first()
+
         if linked_user:
             return Response(
-                {"error": "This Google account is already linked to another user."},
+                {
+                    "error": (
+                        "This Google account is already linked to another user."
+                    )
+                },
                 status=status.HTTP_409_CONFLICT,
             )
 
         request.user.google_sub = google_sub
+
         try:
             request.user.save(update_fields=['google_sub'])
+
         except IntegrityError:
             return Response(
-                {"error": "This Google account is already linked to another user."},
+                {
+                    "error": (
+                        "This Google account is already linked to another user."
+                    )
+                },
                 status=status.HTTP_409_CONFLICT,
             )
 
         return Response(
             {"message": "Google account linked successfully."},
+            status=status.HTTP_200_OK,
+        )
+
+
+# PASSWORD RESET - REQUEST RESET LINK
+class PasswordResetRequestView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        serializer = PasswordResetRequestSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        email = serializer.validated_data['email'].strip().lower()
+
+        user = User.objects.filter(
+            email__iexact=email,
+            is_active=True,
+        ).first()
+
+        if user and user.has_usable_password():
+
+            uid = urlsafe_base64_encode(force_bytes(user.pk))
+            token = default_token_generator.make_token(user)
+
+            reset_link = (
+                f"http://localhost:5173/reset-password/"
+                f"?uid={uid}&token={token}"
+            )
+
+            send_mail(
+                subject="AI SupportHub Password Reset",
+                message=(
+                    "Use the following link to reset your password:\n\n"
+                    f"{reset_link}"
+                ),
+                from_email=None,
+                recipient_list=[user.email],
+                fail_silently=False,
+            )
+
+        return Response(
+            {
+                "message": (
+                    "If an account exists with this email, "
+                    "a password reset link has been sent."
+                )
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+# PASSWORD RESET - CONFIRM NEW PASSWORD
+class PasswordResetConfirmView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        serializer = PasswordResetConfirmSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+
+        return Response(
+            {"message": "Password has been reset successfully."},
             status=status.HTTP_200_OK,
         )
