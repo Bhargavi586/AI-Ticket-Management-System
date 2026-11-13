@@ -30,6 +30,7 @@ INSTALLED_APPS = [
     'accounts',
     'customers', 
     'agents',
+    'categories',
 
 
     'rest_framework_simplejwt',
